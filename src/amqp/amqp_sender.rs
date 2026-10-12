@@ -10,6 +10,7 @@ use url::Url;
 
 use crate::authorization::service_bus_claim;
 use crate::core::RecoverableTransport;
+use crate::diagnostics::phase::Phase;
 use crate::primitives::error::RetryError;
 use crate::sealed::Sealed;
 use crate::sender::MINIMUM_BATCH_SIZE_LIMIT;
@@ -56,31 +57,38 @@ impl RecoverableTransport for AmqpSender {
     type RecoverError = RecoverSenderError;
 
     async fn recover(&mut self) -> Result<(), Self::RecoverError> {
+        let phase = Phase::new("recover_mutex", self.id);
         let mut connection_scope = self.connection_scope.lock().await;
-        connection_scope
-            .recover()
-            .await?;
+        phase.finish("ok");
+        let phase = Phase::new("recover_connection", self.id);
+        phase.result(connection_scope.recover().await)?;
 
         let endpoint = format!("{}/{}", self.service_endpoint, self.entity_path);
         let resource = endpoint.clone();
-        connection_scope
-            .request_refreshable_authorization_using_cbs(
+        let phase = Phase::new("recover_cbs", self.id);
+        phase.result(
+            connection_scope.request_refreshable_authorization_using_cbs(
                 self.id,
                 endpoint,
                 resource,
                 vec![service_bus_claim::SEND.to_string()],
             )
-            .await?;
-        self.sender
-            .detach_then_resume_on_session(&connection_scope.session.handle)
-            .await?;
-        self.management_link = connection_scope
-            .open_management_link(
+            .await,
+        )?;
+        let phase = Phase::new("recover_sender_reattach", self.id);
+        phase.result(
+            self.sender.detach_then_resume_on_session(&connection_scope.session.handle)
+            .await,
+        )?;
+        let phase = Phase::new("recover_management", self.id);
+        self.management_link = phase.result(
+            connection_scope.open_management_link(
                 &self.service_endpoint,
                 &self.entity_path,
                 &self.identifier_str,
             )
-            .await?;
+            .await,
+        )?;
         self.cbs_command_sender = connection_scope.cbs_link.command_sender().clone();
         Ok(())
     }
@@ -95,19 +103,38 @@ impl AmqpSender {
             match &mut batch.state {
                 BatchEnvelopeState::NotSent => match &mut batch.sendable {
                     SendableEnvelope::Single(sendable) => {
-                        let fut = self.sender.send_batchable_ref(sendable).await?;
+                        // Includes credit acquisition and local transfer preparation/queueing;
+                        // completion does not establish that bytes reached the broker.
+                        let phase = Phase::new("send_batchable_ref", self.id);
+                        let fut = phase.result(self.sender.send_batchable_ref(sendable).await)?;
                         batch.state = BatchEnvelopeState::Sent(fut);
                     }
                     SendableEnvelope::Batch(sendable) => {
-                        let fut = self.sender.send_batchable_ref(sendable).await?;
+                        // Includes credit acquisition and local transfer preparation/queueing;
+                        // completion does not establish that bytes reached the broker.
+                        let phase = Phase::new("send_batchable_ref", self.id);
+                        let fut = phase.result(self.sender.send_batchable_ref(sendable).await)?;
                         batch.state = BatchEnvelopeState::Sent(fut);
                     }
                 },
-                BatchEnvelopeState::Sent(fut) => break fut.await?,
+                BatchEnvelopeState::Sent(fut) => {
+                    let phase = Phase::new("send_disposition", self.id);
+                    let outcome = phase.result(fut.await)?;
+                    break outcome;
+                },
                 BatchEnvelopeState::Settled => return Ok(()),
             }
         };
 
+        log::info!(target: "azservicebus::diagnostics",
+            "phase=send_outcome sender_id={} outcome={}", self.id, match &outcome {
+                Outcome::Accepted(_) => "accepted",
+                Outcome::Rejected(_) => "rejected",
+                Outcome::Released(_) => "released",
+                Outcome::Modified(_) => "modified",
+                #[cfg(feature = "transaction")]
+                Outcome::Declared(_) => "declared",
+            });
         batch.state = BatchEnvelopeState::Settled;
 
         match outcome {

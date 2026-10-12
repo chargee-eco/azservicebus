@@ -125,19 +125,31 @@ macro_rules! run_operation {
 
             // Recover before trying the operation
             if _should_try_recover {
+                log::info!(target: "azservicebus::diagnostics",
+                    "phase=retry_recovery attempt={} timeout_ms={} operation_error_type={} outcome=start",
+                    _failed_attempt_count + 1, $try_timeout.as_millis(), std::any::type_name::<$err_ty>());
                 match crate::util::time::timeout($try_timeout, $recover_op).await {
                     Ok(result) => match result {
                         Ok(_) => {
+                            log::info!(target: "azservicebus::diagnostics",
+                                "phase=retry_recovery attempt={} timeout_ms={} operation_error_type={} outcome=ok",
+                                _failed_attempt_count + 1, $try_timeout.as_millis(), std::any::type_name::<$err_ty>());
                             log::info!("Recovery succeeded");
                             _should_try_recover = false;
                         }
                         Err(recover_error) => {
+                            log::warn!(target: "azservicebus::diagnostics",
+                                "phase=retry_recovery attempt={} timeout_ms={} operation_error_type={} outcome=error",
+                                _failed_attempt_count + 1, $try_timeout.as_millis(), std::any::type_name::<$err_ty>());
                             log::error!("Failed to recover {}", &recover_error);
                             _is_scope_disposed |= crate::primitives::service_bus_retry_policy::ServiceBusRetryPolicyError::is_scope_disposed(&recover_error);
                             _should_try_recover = crate::primitives::service_bus_retry_policy::ServiceBusRetryPolicyError::should_try_recover(&recover_error);
                         }
                     }
                     Err(elapsed) => {
+                        log::warn!(target: "azservicebus::diagnostics",
+                            "phase=retry_recovery attempt={} timeout_ms={} operation_error_type={} outcome=timeout",
+                            _failed_attempt_count + 1, $try_timeout.as_millis(), std::any::type_name::<$err_ty>());
                         let err = <$err_ty>::from(elapsed);
                         _is_scope_disposed |= crate::primitives::service_bus_retry_policy::ServiceBusRetryPolicyError::is_scope_disposed(&err);
                     }
@@ -149,7 +161,12 @@ macro_rules! run_operation {
             // recoverable.
             let outcome = match crate::util::time::timeout($try_timeout, $op).await {
                 Ok(result) => result.map_err(<$err_ty>::from),
-                Err(elapsed) => Err(<$err_ty>::from(elapsed)),
+                Err(elapsed) => {
+                    log::warn!(target: "azservicebus::diagnostics",
+                        "phase=retry_operation attempt={} timeout_ms={} operation_error_type={} outcome=timeout",
+                        _failed_attempt_count + 1, $try_timeout.as_millis(), std::any::type_name::<$err_ty>());
+                    Err(<$err_ty>::from(elapsed))
+                },
             };
             match outcome {
                 Ok(outcome) => break outcome,
@@ -170,6 +187,12 @@ macro_rules! run_operation {
                     // check if the error is recoverable
                     _should_try_recover = crate::primitives::service_bus_retry_policy::ServiceBusRetryPolicyError::should_try_recover(&error);
 
+                    log::warn!(target: "azservicebus::diagnostics",
+                        "phase=retry_decision attempt={} timeout_ms={} operation_error_type={} outcome=error recover={} disposed={} retry={} delay_ms={}",
+                        _failed_attempt_count, $try_timeout.as_millis(), std::any::type_name::<$err_ty>(),
+                        _should_try_recover, _is_scope_disposed,
+                        _retry_delay.is_some() && !_is_scope_disposed,
+                        _retry_delay.map(|delay| delay.as_millis()).unwrap_or(0));
                     match (_retry_delay, _is_scope_disposed) {
                         (Some(retry_delay), false) => {
                             log::error!("{}", &error);
