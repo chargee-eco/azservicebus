@@ -94,6 +94,10 @@ impl std::fmt::Debug for AmqpConnectionScope {
 }
 
 impl AmqpConnectionScope {
+    pub(crate) fn diagnostic_state(&self) -> (bool, bool, bool) {
+        (self.connection.handle.is_closed(), self.session.handle.is_ended(), self.is_disposed)
+    }
+
     /// The suffix to attach to the resource path when using web sockets for service communication.
     pub(crate) const WEB_SOCKETS_PATH_SUFFIX: &'static str = "/$servicebus/websocket/";
 

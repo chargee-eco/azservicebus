@@ -47,6 +47,7 @@ use super::{
 };
 
 async fn receive_messages(
+    trace: &crate::diagnostics::receive::ReceiveWait,
     receiver: &mut Receiver,
     prefetch_count: u32,
     receive_mode: &ServiceBusReceiveMode,
@@ -55,18 +56,23 @@ async fn receive_messages(
 ) -> Result<(), AmqpRecvError> {
     // Credit mode is manual, need to set credit
     if prefetch_count == 0 {
+        trace.stage("set_credit");
         receiver.set_credit(max_messages).await?;
     }
 
     for _ in 0..max_messages {
+        trace.stage("amqp_recv");
         let delivery: Delivery<Body<Value>> = receiver.recv().await?;
+        trace.stage("message_received");
 
         let mut is_settled = false;
         if *receive_mode == ServiceBusReceiveMode::ReceiveAndDelete {
+            trace.stage("accept");
             receiver.accept(&delivery).await.map_err(RecvError::from)?;
             is_settled = true;
         }
 
+        trace.stage("extract_lock_token");
         let lock_token =
             lock_token_from_delivery(&delivery).ok_or(AmqpRecvError::LockTokenNotFound)?;
         let (delivery_info, raw_amqp_message) = delivery.into_parts();
@@ -81,6 +87,7 @@ async fn receive_messages(
         };
 
         buffer.push(message);
+        trace.buffered(buffer.len());
     }
     Ok(())
 }
@@ -217,20 +224,31 @@ impl AmqpReceiver {
         max_messages: u32,
         max_wait_time: StdDuration,
     ) -> Result<(), AmqpRecvError> {
-        tokio::select! {
-            _ = crate::util::time::sleep(max_wait_time) => {
-                if prefetch_count == 0 { // credit mode is manual
+        let mut trace = crate::diagnostics::receive::ReceiveWait::new(self.id, prefetch_count, max_messages);
+        trace.observe_scope(self.connection_scope.clone());
+        trace.buffered(buffer.len());
+        let result = tokio::select! {
+            _ = trace.sleep(max_wait_time) => {
+                if prefetch_count == 0 {
+                    trace.stage("drain");
                     if let Err(err) = self.receiver.drain().await {
+                        // Preserve legacy drain handling, but identify the failed phase.
+                        log::warn!(target: "azservicebus::diagnostics", "phase=receive_drain outcome=error error_type={}", std::any::type_name_of_val(&err));
                         log::error!("{}", err);
                     }
                 }
+                trace.finish("wait_elapsed");
                 Ok(())
             }
-            result = receive_messages(&mut self.receiver, prefetch_count, &self.receive_mode, buffer, max_messages) => {
-                result?;
-                Ok(())
+            result = receive_messages(&trace, &mut self.receiver, prefetch_count, &self.receive_mode, buffer, max_messages) => {
+                if let Err(error) = &result {
+                    trace.stage(receive_error_cause(error));
+                }
+                trace.finish(if result.is_ok() { "messages" } else { "amqp_error" });
+                result
             }
-        }
+        };
+        result
     }
 
     async fn complete_message(
@@ -430,7 +448,8 @@ impl TransportReceiver for AmqpReceiver {
                     max_messages,
                     default_max_wait_time
                 ),
-                self.recover()
+                self.recover(),
+                crate::diagnostics::receive::timeout
             )?;
 
             if !buffer.is_empty() {
@@ -461,7 +480,8 @@ impl TransportReceiver for AmqpReceiver {
                 max_messages,
                 max_wait_time
             ),
-            self.recover()
+            self.recover(),
+                crate::diagnostics::receive::timeout
         )?;
         Ok(buffer)
     }
@@ -795,5 +815,25 @@ impl TransportReceiver for AmqpReceiver {
             self.recover()
         )?;
         Ok(response.expirations.into_inner())
+    }
+}
+
+fn receive_error_cause(error: &AmqpRecvError) -> &'static str {
+    use fe2o3_amqp::link::LinkStateError;
+    match error {
+        AmqpRecvError::Recv(RecvError::LinkStateError(state)) => match state {
+            LinkStateError::IllegalState => "illegal_link_state",
+            LinkStateError::IllegalSessionState => "session_dropped",
+            LinkStateError::RemoteDetached => "remote_detached",
+            LinkStateError::RemoteDetachedWithError(_) => "remote_detached_with_error",
+            LinkStateError::RemoteClosed => "remote_closed",
+            LinkStateError::RemoteClosedWithError(_) => "remote_closed_with_error",
+            LinkStateError::ExpectImmediateDetach => "expected_detach",
+        },
+        AmqpRecvError::Recv(RecvError::MessageDecode(_)) => "message_decode",
+        AmqpRecvError::Recv(_) => "transfer_protocol_error",
+        AmqpRecvError::LinkState(_) => "credit_link_state",
+        AmqpRecvError::Elapsed(_) => "elapsed",
+        AmqpRecvError::LockTokenNotFound => "lock_token_missing",
     }
 }

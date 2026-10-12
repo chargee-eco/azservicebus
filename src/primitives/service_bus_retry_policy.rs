@@ -98,7 +98,10 @@ impl<T> ServiceBusRetryPolicyExt for T where
 /// TODO: This is a rather temporary solution as there would be weird lifetime issue if the same
 /// thing is implemented as a method.
 macro_rules! run_operation {
-    ($policy:tt, $err_ty:ty, $try_timeout:ident, $op:expr, $recover_op:expr) => {{
+    ($policy:tt, $err_ty:ty, $try_timeout:ident, $op:expr, $recover_op:expr) => {
+        run_operation!($policy, $err_ty, $try_timeout, $op, $recover_op, crate::util::time::timeout)
+    };
+    ($policy:tt, $err_ty:ty, $try_timeout:ident, $op:expr, $recover_op:expr, $timeout:path) => {{
         let mut _failed_attempt_count = 0; // avoid accidental shadowing
         let mut _should_try_recover = false; // avoid accidental shadowing
         let mut _is_scope_disposed = false; // avoid accidental shadowing
@@ -159,7 +162,7 @@ macro_rules! run_operation {
             // TODO: should we even try to run the operation if recovery failed? The current impl
             // needs to try to run the operation to get the error to determine if the error is
             // recoverable.
-            let outcome = match crate::util::time::timeout($try_timeout, $op).await {
+            let outcome = match $timeout($try_timeout, $op).await {
                 Ok(result) => result.map_err(<$err_ty>::from),
                 Err(elapsed) => {
                     log::warn!(target: "azservicebus::diagnostics",
